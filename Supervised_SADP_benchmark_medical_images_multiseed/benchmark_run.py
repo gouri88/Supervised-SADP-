@@ -1,0 +1,802 @@
+"""
+benchmark_run.py
+=================
+
+Focused comparison driver for Supervised SADP. Unlike a general-purpose
+sweep tool, this script is deliberately scoped to ONE comparison:
+
+    4 encodings   x  k-shift values  x  reward modes
+    (poisson_only, lbp+poisson, lbp_clbp+poisson, cnn+poisson)
+
+on the three standard vision datasets (MNIST / Fashion-MNIST / CIFAR-10),
+1SADP only, so the output is a single, directly-comparable results table
+rather than a sprawling general-purpose grid.
+
+This script only depends on `sadp_core.py` (must be importable - keep both
+files in the same directory, or put `sadp_core.py` on your PYTHONPATH).
+
+-----------------------------------------------------------------------
+Quick start
+-----------------------------------------------------------------------
+    # Fast smoke test (tiny epoch count, MNIST only) to check everything
+    # is wired up correctly before committing to a long run:
+    python benchmark_run.py --quick
+
+    # The full comparison: all 4 encodings, k in {0, 5, 10}, reward_mode
+    # in {none, binary, margin}, on all three standard datasets (this is
+    # also just running with no flags at all - these are the defaults):
+    python benchmark_run.py \
+        --datasets mnist,fmnist,cifar10 \
+        --encodings poisson_only,lbp+poisson,lbp_clbp+poisson,cnn+poisson \
+        --k-shifts 0,5,10 \
+        --reward-modes none,binary,margin \
+        --epochs 50
+
+    # Skip the CNN pathway (no TensorFlow installed / not needed):
+    python benchmark_run.py --encodings poisson_only,lbp+poisson,lbp_clbp+poisson
+
+    # Just the two axes of interest, holding encoding fixed:
+    python benchmark_run.py --encodings lbp+poisson --k-shifts 0,5,10 \
+        --reward-modes none,binary,margin
+
+    # Compare plain LBP against Complete LBP (CLBP) directly:
+    python benchmark_run.py --encodings lbp+poisson,lbp_clbp+poisson
+
+    # Revisit 2SADP later if you want it (not run by default):
+    python benchmark_run.py --architectures 1SADP,2SADP
+
+    # For a statistically credible comparison rather than a single noisy
+    # run, sweep multiple seeds (results aggregate as mean+-std per cell):
+    python benchmark_run.py --encodings lbp+poisson --seeds 42,43,44,45,46
+
+-----------------------------------------------------------------------
+Adding a new dataset
+-----------------------------------------------------------------------
+Add one entry to the DATASET_LOADERS registry below - a zero-argument
+function returning the same ((x_train,y_train),(x_test,y_test),input_shape)
+shape that `sadp_core.load_dataset` returns. Nothing else in this file, or
+in sadp_core.py, needs to change. For example:
+
+    def _load_my_dataset():
+        x_train, y_train, x_test, y_test = ...   # your own loading code
+        # x in [0,1] float32, shape (N,H,W) or (N,H,W,C); y integer ids
+        return (x_train, y_train), (x_test, y_test), x_train.shape[1:]
+
+    DATASET_LOADERS["my_dataset"] = _load_my_dataset
+
+Then just: python benchmark_run.py --datasets my_dataset
+
+Every run is wrapped in a try/except: if one configuration fails (e.g. an
+unsupported combination, OOM, etc.) it is logged and skipped, and the grid
+continues - a single bad cell never kills a multi-hour benchmarking run.
+
+Results so far are also checkpointed to disk after every configuration, so
+an interrupted run never loses completed results.
+-----------------------------------------------------------------------
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import time
+import traceback
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Tuple
+
+import pandas as pd
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(iterable=None, *args, **kwargs):
+        return iterable if iterable is not None else range(0)
+
+import sadp_core as sc
+
+
+# ---------------------------------------------------------------------------
+# Dataset registry - the one place to touch for a new dataset
+# ---------------------------------------------------------------------------
+# Each entry maps a name to a zero-argument loader returning exactly what
+# `sc.run_experiment`'s `data=` parameter expects:
+#     (x_train, y_train), (x_test, y_test), input_shape
+# with x in [0,1] float32, shape (N,H,W) or (N,H,W,C), y integer class ids.
+# The three built-ins just delegate to `sc.load_dataset` (which needs
+# TensorFlow, for the Keras dataset download). To add your own dataset,
+# write a loader function and add one line here - see the module
+# docstring above for a worked example.
+
+DATASET_LOADERS: Dict[str, Callable[[], Any]] = {
+    "mnist": lambda: sc.load_dataset("mnist"),
+    "fmnist": lambda: sc.load_dataset("fmnist"),
+    "cifar10": lambda: sc.load_dataset("cifar10"),
+}
+
+# ---------------------------------------------------------------------------
+# Medical image dataset loaders  (folder-based, one sub-folder per class)
+# ---------------------------------------------------------------------------
+# Default root.  Override at runtime with:
+#   --dataset-root "C:\Users\user\Desktop\Gouri\Dataset"
+_DATASET_ROOT: Path = Path("C:/Users/user/Desktop/Gouri/Dataset")
+
+_MEDICAL_IMG_SIZE: Tuple[int, int] = (64, 64)   # resize target (H, W)
+_TRAIN_RATIO: float = 0.80                        # 80 % train / 20 % test
+
+
+def _load_folder_dataset(
+    root: Path,
+    img_size: Tuple[int, int] = _MEDICAL_IMG_SIZE,
+    train_ratio: float = _TRAIN_RATIO,
+    grayscale: bool = False,
+    seed: int = 42,
+):
+    """Generic loader: one sub-folder per class -> (train, test, input_shape).
+
+    x arrays are float32 in [0, 1], shape (N, H, W, C).
+    y arrays are int64 class indices (0 ... n_classes-1).
+    """
+    try:
+        from PIL import Image as PILImage
+    except ImportError as exc:
+        raise ImportError(
+            "Pillow is required to load medical image datasets. "
+            "Install it with:  pip install Pillow"
+        ) from exc
+
+    import numpy as np
+    import logging
+
+    root = Path(root)
+    _log = logging.getLogger("sadp")
+
+    if not root.exists():
+        raise FileNotFoundError(
+            "Dataset root not found: " + str(root) + "\n"
+            "Fix: pass the real path with --dataset-root, e.g.:\n"
+            "  python benchmark_run.py --datasets colon,lung,tumour "
+            "--dataset-root \"C:/Users/user/Desktop/Gouri/Dataset\" --epochs 10"
+        )
+
+    class_dirs = sorted(
+        [d for d in root.iterdir() if d.is_dir()],
+        key=lambda d: d.name.lower(),
+    )
+    if not class_dirs:
+        raise ValueError("No sub-folders (classes) found inside: " + str(root))
+
+    _log.info(
+        "Loading folder dataset from %s | classes=%s | img_size=%s",
+        root, [d.name for d in class_dirs], img_size,
+    )
+
+    supported = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    H, W = img_size
+    mode = "L" if grayscale else "RGB"
+    rng  = np.random.default_rng(seed)
+
+    x_tr, y_tr, x_te, y_te = [], [], [], []
+
+    for label, cdir in enumerate(class_dirs):
+        paths = sorted([p for p in cdir.iterdir() if p.suffix.lower() in supported])
+        if not paths:
+            _log.warning("Class folder '%s' has no supported images — skipping.", cdir.name)
+            continue
+        idx     = rng.permutation(len(paths))
+        n_train = max(1, int(len(paths) * train_ratio))
+        for i in idx[:n_train]:
+            try:
+                img = PILImage.open(paths[i]).convert(mode)
+                img = img.resize((W, H), PILImage.LANCZOS)
+                arr = np.array(img, dtype=np.float32) / 255.0
+                if arr.ndim == 2:
+                    arr = arr[:, :, np.newaxis]
+                x_tr.append(arr); y_tr.append(label)
+            except Exception as e:
+                _log.warning("Could not load %s: %s", paths[i], e)
+        for i in idx[n_train:]:
+            try:
+                img = PILImage.open(paths[i]).convert(mode)
+                img = img.resize((W, H), PILImage.LANCZOS)
+                arr = np.array(img, dtype=np.float32) / 255.0
+                if arr.ndim == 2:
+                    arr = arr[:, :, np.newaxis]
+                x_te.append(arr); y_te.append(label)
+            except Exception as e:
+                _log.warning("Could not load %s: %s", paths[i], e)
+        _log.info("  Class %d '%s': %d train, %d test",
+                  label, cdir.name, n_train, len(paths) - n_train)
+
+    if not x_tr:
+        raise ValueError("No images loaded from " + str(root) + ". Check formats/paths.")
+
+    x_train = np.stack(x_tr).astype(np.float32)
+    y_train = np.array(y_tr, dtype=np.int64)
+    x_test  = np.stack(x_te).astype(np.float32)
+    y_test  = np.array(y_te, dtype=np.int64)
+    input_shape = x_train.shape[1:]
+    _log.info("Loaded %s | shape=%s | train=%s test=%s | n_classes=%d",
+              root.name, input_shape, x_train.shape, x_test.shape, len(class_dirs))
+    return (x_train, y_train), (x_test, y_test), input_shape
+
+
+def _load_colon_dataset():
+    """colon_image_sets  (2 class sub-folders: colon adenocarcinoma / normal)."""
+    return _load_folder_dataset(_DATASET_ROOT / "colon_image_sets")
+
+def _load_lung_dataset():
+    """lung_image_sets   (3 class sub-folders: aca / benign / scc)."""
+    return _load_folder_dataset(_DATASET_ROOT / "lung_image_sets")
+
+def _load_folder_dataset_nested(
+    root: Path,
+    class_sources: dict,          # {class_name: Path-or-list-of-Paths}
+    img_size: Tuple[int, int] = _MEDICAL_IMG_SIZE,
+    train_ratio: float = _TRAIN_RATIO,
+    grayscale: bool = False,
+    seed: int = 42,
+):
+    """Loader for datasets where a class spans multiple sub-folders.
+
+    class_sources maps a display class name to one or more folders whose
+    images all share that label.  Example for 4-class tumour:
+        {
+          "Normal":           [root / "Normal"],
+          "glioma_tumor":     [root / "Tumor" / "glioma_tumor"],
+          "meningioma_tumor": [root / "Tumor" / "meningioma_tumor"],
+          "pituitary_tumor":  [root / "Tumor" / "pituitary_tumor"],
+        }
+    """
+    import numpy as np
+    import logging
+    try:
+        from PIL import Image as PILImage
+    except ImportError as exc:
+        raise ImportError("Pillow required: pip install Pillow") from exc
+
+    _log = logging.getLogger("sadp")
+    supported = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    H, W = img_size
+    mode = "L" if grayscale else "RGB"
+    rng  = np.random.default_rng(seed)
+
+    x_tr, y_tr, x_te, y_te = [], [], [], []
+
+    for label, (class_name, folders) in enumerate(class_sources.items()):
+        if isinstance(folders, Path):
+            folders = [folders]
+        # Collect all images across all folders for this class
+        all_paths = []
+        for folder in folders:
+            if not folder.exists():
+                _log.warning("Class '%s': folder not found: %s", class_name, folder)
+                continue
+            all_paths.extend(
+                sorted([p for p in folder.iterdir() if p.suffix.lower() in supported])
+            )
+        if not all_paths:
+            _log.warning("Class '%s': no images found in %s — skipping.", class_name, folders)
+            continue
+
+        idx     = rng.permutation(len(all_paths))
+        n_train = max(1, int(len(all_paths) * train_ratio))
+
+        def _load(path_list):
+            out = []
+            for p in path_list:
+                try:
+                    img = PILImage.open(p).convert(mode)
+                    img = img.resize((W, H), PILImage.LANCZOS)
+                    arr = np.array(img, dtype=np.float32) / 255.0
+                    if arr.ndim == 2:
+                        arr = arr[:, :, np.newaxis]
+                    out.append(arr)
+                except Exception as e:
+                    _log.warning("Could not load %s: %s", p, e)
+            return out
+
+        train_imgs = _load([all_paths[i] for i in idx[:n_train]])
+        test_imgs  = _load([all_paths[i] for i in idx[n_train:]])
+        x_tr.extend(train_imgs); y_tr.extend([label] * len(train_imgs))
+        x_te.extend(test_imgs);  y_te.extend([label] * len(test_imgs))
+        _log.info("  Class %d '%s': %d train, %d test (from %d total images)",
+                  label, class_name, len(train_imgs), len(test_imgs), len(all_paths))
+
+    if not x_tr:
+        raise ValueError("No images loaded from " + str(root) + ". Check folder paths.")
+
+    x_train = np.stack(x_tr).astype(np.float32)
+    y_train = np.array(y_tr, dtype=np.int64)
+    x_test  = np.stack(x_te).astype(np.float32)
+    y_test  = np.array(y_te, dtype=np.int64)
+    input_shape = x_train.shape[1:]
+    _log.info("Nested-load complete | shape=%s | train=%s test=%s | n_classes=%d",
+              input_shape, x_train.shape, x_test.shape, len(class_sources))
+    return (x_train, y_train), (x_test, y_test), input_shape
+
+
+def _load_tumour_dataset():
+    """Tumour_classification — 4 classes: Normal + 3 tumour subtypes.
+
+    Folder layout on disk:
+        Tumour_classification/
+            Normal/                  <- normal brain MRI images
+            Tumor/
+                glioma_tumor/        <- glioma images
+                meningioma_tumor/    <- meningioma images
+                pituitary_tumor/     <- pituitary images
+
+    The original 2-class loader was wrong: it tried to load images directly
+    from Tumor/ but Tumor/ only contains sub-folders (no images at that
+    level), so only Normal ever loaded.  This version explicitly maps each
+    leaf sub-folder to its own class label, giving 4 balanced classes.
+
+    If you prefer 2-class (Normal vs any Tumor), set TUMOUR_BINARY = True.
+    """
+    TUMOUR_BINARY = False          # ← set True for Normal-vs-Tumor binary mode
+
+    root = _DATASET_ROOT / "Tumour_classification"
+    tumor_root = root / "Tumor"
+
+    if TUMOUR_BINARY:
+        # Merge all three tumour sub-folders into a single "Tumor" class
+        class_sources = {
+            "Normal": [root / "Normal"],
+            "Tumor":  [tumor_root / "glioma_tumor",
+                       tumor_root / "meningioma_tumor",
+                       tumor_root / "pituitary_tumor"],
+        }
+    else:
+        # 4 separate classes (recommended — more informative)
+        class_sources = {
+            "Normal":            [root / "Normal"],
+            "glioma_tumor":      [tumor_root / "glioma_tumor"],
+            "meningioma_tumor":  [tumor_root / "meningioma_tumor"],
+            "pituitary_tumor":   [tumor_root / "pituitary_tumor"],
+        }
+
+    return _load_folder_dataset_nested(root, class_sources)
+
+
+DATASET_LOADERS["colon"]  = _load_colon_dataset
+DATASET_LOADERS["lung"]   = _load_lung_dataset
+DATASET_LOADERS["tumour"] = _load_tumour_dataset
+
+# The four encodings this script is scoped to compare: poisson_only and
+# cnn+poisson are the low/high baselines; lbp+poisson is the classic
+# single-scale descriptor; lbp_clbp+poisson (Complete LBP) is the new
+# candidate that beat plain LBP in initial testing and is included here
+# pending a fuller multi-dataset/multi-k_shift validation pass - see
+# sadp_core.py's module docstring for what else was tried and dropped.
+DEFAULT_ENCODINGS = ["poisson_only", "lbp+poisson", "lbp_clbp+poisson", "cnn+poisson"]
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _csv_list(s: str) -> List[str]:
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def _csv_int_list(s: str) -> List[int]:
+    return [int(x) for x in _csv_list(s)]
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Compare Supervised SADP across 4 encodings "
+                    "(poisson_only, lbp+poisson, lbp_clbp+poisson, cnn+poisson) "
+                    "x k-shift x reward-mode, on MNIST/FMNIST/CIFAR-10."
+    )
+    _BUILTIN = ["mnist", "fmnist", "cifar10"]
+    _MEDICAL = ["colon", "lung", "tumour"]
+    p.add_argument("--datasets", type=_csv_list,
+                    default=_BUILTIN,
+                    help=(
+                        "Comma-separated dataset names. "
+                        f"Built-in (auto-download): {', '.join(_BUILTIN)}. "
+                        f"Medical/local (need --dataset-root): {', '.join(_MEDICAL)}. "
+                        "Example: --datasets colon,lung,tumour"
+                    ))
+    p.add_argument("--dataset-root", type=str, default=None,
+                    help=(
+                        "Root folder containing colon_image_sets/, lung_image_sets/, "
+                        "and Tumour_classification/. Override the hardcoded default when "
+                        "your dataset lives elsewhere. "
+                        "Example: --dataset-root \"C:/Users/user/Desktop/Gouri/Dataset\""
+                    ))
+    p.add_argument("--encodings", type=_csv_list, default=DEFAULT_ENCODINGS,
+                    help="Comma-separated encoding types. Available: "
+                        + ", ".join(sc.ENCODING_TYPES))
+    p.add_argument("--architectures", type=_csv_list, default=["1SADP"],
+                    help="Comma-separated architectures: 1SADP, 2SADP. "
+                        "Defaults to 1SADP only; pass --architectures "
+                        "1SADP,2SADP to bring 2SADP back into the sweep.")
+    p.add_argument("--timesteps", type=_csv_int_list, default=[25],
+                    help="Comma-separated timestep (T) values, e.g. 25,100. "
+                        "Default is just 25 to keep the 6-dimensional grid "
+                        "(dataset x encoding x arch x T x k_shift x reward_mode) "
+                        "a manageable size; add 100 for the fuller sweep.")
+
+    # ---- The two supervision axes this script compares ----
+    p.add_argument("--k-shifts", type=_csv_int_list, default=[0, 5, 10],
+                    help="Comma-separated k_shift values, e.g. 0,5,10. k=0 is "
+                        "the original (un-shifted) supervised SADP rule.")
+    p.add_argument("--reward-modes", type=_csv_list, default=["none", "binary", "margin"],
+                    help="Comma-separated reward_mode values to sweep: "
+                        "none, binary, margin. 'none' reproduces the original "
+                        "two-factor (pre x agreement) rule with zero overhead; "
+                        "'binary'/'margin' add the third (global reward) factor.")
+    p.add_argument("--weight-by-overlap", action="store_true",
+                    help="Weight the k-shifted kappa aggregation by per-offset "
+                        "overlap length instead of a plain mean. Applies to "
+                        "every k_shift value in the sweep above.")
+    p.add_argument("--reward-scale", type=float, default=1.0,
+                    help="Multiplier applied to the reward signal before it "
+                        "scales kappa. Applies to every reward_mode in the "
+                        "sweep above (has no effect when reward_mode='none').")
+    p.add_argument("--reward-baseline", action="store_true",
+                    help="Subtract a running EMA of the batch-mean reward "
+                        "before using it (REINFORCE-style advantage). Applies "
+                        "to every reward_mode in the sweep above.")
+    p.add_argument("--reward-baseline-decay", type=float, default=0.99,
+                    help="EMA decay for --reward-baseline (closer to 1 = smoother).")
+
+    # ---- Training / infra ----
+    p.add_argument("--epochs", type=int, default=50, help="SNN training epochs per configuration.")
+    p.add_argument("--batch-size", type=int, default=128, help="SNN training batch size.")
+    p.add_argument("--eval-batch-size", type=int, default=256, help="Evaluation batch size.")
+    p.add_argument("--eval-every", type=int, default=None,
+                    help="Evaluate on held-out data every N epochs during "
+                        "training (in addition to the final eval), and "
+                        "record it as Epoch_Eval_Accuracies. Off by default "
+                        "since it costs an extra eval pass per N epochs - "
+                        "set e.g. --eval-every 1 for every epoch (most "
+                        "informative, most expensive) or --eval-every 5 for "
+                        "a cheaper periodic check. Weight-stability "
+                        "diagnostics (Epoch_W1_CosSim_Prev, Epoch_W1_FrobNorm, "
+                        "Epoch_W2_FrobNorm) are always recorded regardless - "
+                        "they're effectively free.")
+    p.add_argument("--nhid", type=int, default=256, help="Hidden layer size.")
+    p.add_argument("--eta-in", type=float, default=2e-4,
+                    help="Hidden-layer (SADP) learning rate. NOTE: if you're "
+                        "comparing against benchmark_run_stdp.py, the same "
+                        "numeric eta_in does NOT mean a comparable effective "
+                        "step size for STDP's differently-scaled signal - see "
+                        "stdp_core.py's calibrate_eta_in() before treating a "
+                        "shared eta_in as a controlled comparison.")
+    p.add_argument("--eta-out", type=float, default=5e-4,
+                    help="Output-layer learning rate (shared mechanism with STDP).")
+    p.add_argument("--feature-dim", type=int, default=256, help="CNN encoder output dim (cnn+poisson only).")
+    p.add_argument("--encoder-epochs", type=int, default=50, help="CNN pretraining epochs (cnn+poisson only).")
+    p.add_argument("--classical-grid", type=str, default="4,4",
+                    help="Grid rows,cols for the LBP/CLBP spatial blocks, e.g. '4,4'.")
+    p.add_argument("--classical-bins", type=int, default=16,
+                    help="Histogram bins per block, used by both 'lbp+poisson' "
+                        "and 'lbp_clbp+poisson'.")
+    p.add_argument("--seeds", type=_csv_int_list, default=[42],
+                    help="Comma-separated random seeds, e.g. 42,43,44. Default "
+                        "is a single seed (matches prior behavior); for any "
+                        "claim like 'X beats Y' to be statistically credible, "
+                        "use >=3 seeds and look at mean+-std in the pivot "
+                        "tables, not a single run. Affects weight init, batch "
+                        "order, AND (for cnn+poisson) feature-cache identity - "
+                        "so each seed re-trains the CNN encoder too, not just "
+                        "the SNN; this is intentional, not a cache miss bug.")
+    p.add_argument("--output-dir", type=str, default=".", help="Directory for results/log files.")
+    p.add_argument("--output-prefix", type=str, default="sadp_comparison",
+                    help="Filename prefix for the results Excel/CSV and the log file.")
+    p.add_argument("--quick", action="store_true",
+                    help="Fast smoke-test mode: mnist only, poisson_only + "
+                        "lbp_clbp+poisson, 1SADP only, T=25, k in {0,5}, "
+                        "reward_mode in {none,binary}, 2 epochs, small batch. "
+                        "Use this first to verify the pipeline runs end to "
+                        "end on your machine.")
+    p.add_argument("--no-progress", action="store_true",
+                    help="Disable tqdm progress bars (e.g. for non-interactive logs).")
+    return p
+
+
+def apply_quick_overrides(args: argparse.Namespace) -> argparse.Namespace:
+    # Keep quick-mode on the auto-downloadable dataset only.
+    args.datasets = ["mnist"]
+    args.encodings = ["poisson_only", "lbp_clbp+poisson"]
+    args.architectures = ["1SADP"]
+    args.timesteps = [25]
+    args.k_shifts = [0, 5]
+    args.reward_modes = ["none", "binary"]
+    args.epochs = 2
+    args.batch_size = 64
+    args.encoder_epochs = 2
+    logging.getLogger("sadp").info("`--quick` mode: overriding grid to a fast smoke test.")
+    return args
+
+
+# ---------------------------------------------------------------------------
+# Grid runner
+# ---------------------------------------------------------------------------
+
+def run_grid(args: argparse.Namespace) -> pd.DataFrame:
+    logger = logging.getLogger("sadp")
+    classical_grid = tuple(int(x) for x in args.classical_grid.split(","))
+    show_progress = not args.no_progress
+
+    for dname in args.datasets:
+        if dname not in DATASET_LOADERS:
+            raise ValueError(
+                f"Unknown dataset '{dname}'. Available: {list(DATASET_LOADERS.keys())}. "
+                "Add new datasets to DATASET_LOADERS at the top of this file."
+            )
+
+    # Loop order matters for cache efficiency: group everything that shares
+    # the same (dataset, encoding, seed) triple together, since the encoded
+    # features (and, for cnn+poisson, the CNN training that produces them)
+    # depend on dataset/encoding/seed but NOT on architecture, T, k_shift,
+    # or reward_mode. seed sits right after encoding (not innermost) because
+    # it DOES invalidate the feature cache (cnn+poisson's CNN encoder is
+    # itself seed-dependent) - architecture/T/k_shift/reward_mode are swept
+    # innermost since they're the cheapest knobs to vary (pure training-time
+    # effects, no re-extraction at all).
+    grid: List[Dict[str, Any]] = []
+    for dname in args.datasets:
+        for encoding in args.encodings:
+            for seed in args.seeds:
+                for arch in args.architectures:
+                    for T_val in args.timesteps:
+                        for k in args.k_shifts:
+                            for reward_mode in args.reward_modes:
+                                grid.append({
+                                    "dataset_name": dname, "encoding_type": encoding,
+                                    "seed": seed, "architecture": arch, "T": T_val,
+                                    "k_shift": k, "reward_mode": reward_mode,
+                                })
+
+    logger.info("Comparison grid has %d configurations.", len(grid))
+    logger.info("Features (and any CNN encoder training) are cached per "
+                "(dataset, encoding, seed) triple and reused across "
+                "architecture/T/k_shift/reward_mode.")
+
+    results: List[Dict[str, Any]] = []
+    checkpoint_path = os.path.join(args.output_dir, f"{args.output_prefix}_checkpoint.csv")
+
+    dataset_cache: Dict[str, Any] = {}
+    feature_cache: Dict[Any, Any] = {}
+
+    pbar = tqdm(grid, desc="Comparison grid", disable=not show_progress)
+    for cfg in pbar:
+        tag = (f"{cfg['dataset_name']}|{cfg['encoding_type']}|seed={cfg['seed']}|"
+               f"{cfg['architecture']}|T={cfg['T']}|k={cfg['k_shift']}|reward={cfg['reward_mode']}")
+        pbar.set_postfix_str(tag)
+        logger.info("-" * 70)
+        logger.info("Starting configuration: %s", tag)
+
+        t_cfg0 = time.time()
+        try:
+            if cfg["dataset_name"] not in dataset_cache:
+                dataset_cache[cfg["dataset_name"]] = DATASET_LOADERS[cfg["dataset_name"]]()
+            data = dataset_cache[cfg["dataset_name"]]
+
+            result = sc.run_experiment(
+                dataset_name=cfg["dataset_name"], data=data,
+                encoding_type=cfg["encoding_type"], architecture=cfg["architecture"],
+                T=cfg["T"], k_shift=cfg["k_shift"], weight_by_overlap=args.weight_by_overlap,
+                reward_mode=cfg["reward_mode"], reward_scale=args.reward_scale,
+                reward_baseline=args.reward_baseline,
+                reward_baseline_decay=args.reward_baseline_decay,
+                Nhid=args.nhid, eta_in=args.eta_in, eta_out=args.eta_out,
+                seed=cfg["seed"], feature_dim=args.feature_dim,
+                encoder_epochs=args.encoder_epochs, classical_grid=classical_grid,
+                classical_n_bins=args.classical_bins,
+                n_epochs=args.epochs, batch_size=args.batch_size,
+                eval_batch_size=args.eval_batch_size, eval_every=args.eval_every,
+                show_progress=show_progress, feature_cache=feature_cache,
+            )
+            result["Config_Wall_Time_s"] = time.time() - t_cfg0
+            result["Status"] = "OK"
+            results.append(result)
+
+        except Exception as exc:  # noqa: BLE001 - keep the grid alive
+            logger.error("Configuration FAILED: %s | %s", tag, exc)
+            logger.debug(traceback.format_exc())
+            results.append({
+                "Dataset": cfg["dataset_name"].upper(), "Encoding": cfg["encoding_type"],
+                "Seed": cfg["seed"], "Architecture": cfg["architecture"], "Timestep": cfg["T"],
+                "K_shift": cfg["k_shift"], "Reward_Mode": cfg["reward_mode"],
+                "Status": f"FAILED: {exc}",
+                "Config_Wall_Time_s": time.time() - t_cfg0,
+            })
+
+        # Checkpoint after every configuration so partial progress is never lost.
+        pd.DataFrame(results).to_csv(checkpoint_path, index=False)
+
+    return pd.DataFrame(results)
+
+
+# ---------------------------------------------------------------------------
+# Saving results
+# ---------------------------------------------------------------------------
+
+def save_results(df: pd.DataFrame, args: argparse.Namespace) -> None:
+    logger = logging.getLogger("sadp")
+    os.makedirs(args.output_dir, exist_ok=True)
+    excel_path = os.path.join(args.output_dir, f"{args.output_prefix}.xlsx")
+    csv_path = os.path.join(args.output_dir, f"{args.output_prefix}.csv")
+
+    df.to_csv(csv_path, index=False)
+    logger.info("Saved full results CSV -> %s", csv_path)
+
+    try:
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="All_Results", index=False)
+            if "Encoding" in df.columns:
+                for encoding in sorted(df["Encoding"].dropna().unique()):
+                    sheet_name = encoding.replace("+", "_")[:31]  # Excel sheet name limit
+                    sub = df[df["Encoding"] == encoding]
+                    sub.to_excel(writer, sheet_name=sheet_name, index=False)
+            # One pivot per dataset: Encoding x (K_shift, Reward_Mode) -> accuracy
+            # mean/std/count across seeds (averaged over architecture/T too) -
+            # the at-a-glance comparison view, with the seed count visible so
+            # a single-seed result isn't mistaken for a statistically
+            # supported one.
+            if {"Dataset", "Encoding", "K_shift", "Reward_Mode", "Eval_Accuracy"} <= set(df.columns):
+                ok = df[df.get("Status", "OK") == "OK"]
+                for dname in sorted(ok["Dataset"].dropna().unique()):
+                    sub = ok[ok["Dataset"] == dname]
+                    pivot = sub.pivot_table(
+                        index="Encoding", columns=["K_shift", "Reward_Mode"],
+                        values="Eval_Accuracy", aggfunc=["mean", "std", "count"],
+                    )
+                    sheet_name = f"Pivot_{dname}"[:31]
+                    pivot.to_excel(writer, sheet_name=sheet_name)
+        logger.info("Saved results Excel workbook -> %s", excel_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not write Excel file (%s); CSV was still saved.", exc)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+    if args.quick:
+        args = apply_quick_overrides(args)
+
+    # Apply --dataset-root override BEFORE any loader is called.
+    if getattr(args, "dataset_root", None) is not None:
+        global _DATASET_ROOT
+        _DATASET_ROOT = Path(args.dataset_root)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(args.output_dir, f"{args.output_prefix}_{timestamp}.log")
+    sc.configure_logging(log_file=log_path, level=logging.INFO)
+    logger = logging.getLogger("sadp")
+
+    # Pre-flight: verify medical dataset paths BEFORE the grid starts so a
+    # bad path fails immediately with a clear message, not 100+ FAILED rows.
+    _MED_SUBS = {
+        "colon":  "colon_image_sets",
+        "lung":   "lung_image_sets",
+        "tumour": "Tumour_classification",
+    }
+    medical_requested = [d for d in args.datasets if d in _MED_SUBS]
+    if medical_requested:
+        logger.info("Dataset root: %s", _DATASET_ROOT)
+        if not _DATASET_ROOT.exists():
+            print(
+                f"\n[ERROR] Dataset root not found: {_DATASET_ROOT}\n"
+                "Fix: pass the correct path with --dataset-root, e.g.:\n"
+                "  python benchmark_run.py --datasets colon,lung,tumour "
+                "--dataset-root \"C:/Users/user/Desktop/Gouri/Dataset\" --epochs 10\n",
+                flush=True,
+            )
+            raise SystemExit(1)
+        path_errors = []
+        for dname in medical_requested:
+            subfolder = _DATASET_ROOT / _MED_SUBS[dname]
+            if not subfolder.exists():
+                path_errors.append(f"  {dname}: expected at {subfolder}")
+            else:
+                cdirs = [d for d in subfolder.iterdir() if d.is_dir()]
+                logger.info("  OK %-8s -> %s  (%d class folders: %s)",
+                            dname, subfolder, len(cdirs),
+                            [d.name for d in sorted(cdirs)])
+                # Extra check for tumour: warn if Tumor/ has no direct images
+                # (images are nested one level deeper)
+                if dname == "tumour":
+                    tumor_dir = subfolder / "Tumor"
+                    if tumor_dir.exists():
+                        direct_imgs = [p for p in tumor_dir.iterdir()
+                                       if p.suffix.lower() in
+                                       {".jpg",".jpeg",".png",".bmp",".tif",".tiff"}]
+                        sub_dirs = [d for d in tumor_dir.iterdir() if d.is_dir()]
+                        if not direct_imgs and sub_dirs:
+                            logger.info(
+                                "    NOTE: Tumor/ has no direct images but %d sub-folders "
+                                "(%s). Using 4-class nested loader (Normal + 3 tumour types).",
+                                len(sub_dirs), [d.name for d in sorted(sub_dirs)]
+                            )
+        if path_errors:
+            print(
+                "\n[ERROR] Sub-folders not found:\n" + "\n".join(path_errors)
+                + "\nCheck names match exactly (including case).\n",
+                flush=True,
+            )
+            raise SystemExit(1)
+
+    n_grid = (len(args.datasets) * len(args.encodings) * len(args.seeds)
+              * len(args.architectures) * len(args.timesteps)
+              * len(args.k_shifts) * len(args.reward_modes))
+
+    logger.info("=" * 70)
+    logger.info("Supervised SADP comparison run starting.")
+    logger.info("Datasets:      %s", args.datasets)
+    logger.info("Encodings:     %s", args.encodings)
+    logger.info("Seeds:         %s%s", args.seeds,
+                "  (single seed - add more for statistically credible comparisons)"
+                if len(args.seeds) == 1 else "")
+    logger.info("Architectures: %s", args.architectures)
+    logger.info("Timesteps:     %s", args.timesteps)
+    logger.info("K-shifts:      %s", args.k_shifts)
+    logger.info("Reward modes:  %s (scale=%s, baseline=%s)",
+                args.reward_modes, args.reward_scale, args.reward_baseline)
+    logger.info("Epochs:        %s", args.epochs)
+    logger.info("Eta_in/out:    %s / %s", args.eta_in, args.eta_out)
+    logger.info("Grid size:     %d configurations", n_grid)
+    logger.info("Log file:      %s", log_path)
+    logger.info("=" * 70)
+
+    t0 = time.time()
+    df = run_grid(args)
+    total_time = time.time() - t0
+
+    n_ok = int((df["Status"] == "OK").sum()) if "Status" in df.columns else len(df)
+    n_total = len(df)
+    logger.info("Grid complete in %.1fs | %d/%d configurations succeeded.",
+                total_time, n_ok, n_total)
+
+    save_results(df, args)
+
+    print("\n" + "=" * 70)
+    print("SUPERVISED SADP COMPARISON SUMMARY")
+    print("=" * 70)
+    display_cols = [c for c in [
+        "Dataset", "Encoding", "Architecture", "Timestep", "K_shift", "Reward_Mode",
+        "Seed", "Eval_Accuracy", "F1_score", "Avg_Time_per_Epoch_s", "Status",
+    ] if c in df.columns]
+    with pd.option_context("display.max_rows", None, "display.width", 180):
+        print(df[display_cols].to_string(index=False))
+
+    # Quick at-a-glance pivot in the console too: mean (and, if >1 seed was
+    # run, std dev across seeds) Eval_Accuracy per dataset, encoding x
+    # (k_shift, reward_mode) - in addition to the full table above.
+    if {"Dataset", "Encoding", "K_shift", "Reward_Mode", "Eval_Accuracy"} <= set(df.columns):
+        ok = df[df.get("Status", "OK") == "OK"]
+        for dname in sorted(ok["Dataset"].dropna().unique()):
+            sub = ok[ok["Dataset"] == dname]
+            if sub.empty:
+                continue
+            stats = (sub.groupby(["Encoding", "K_shift", "Reward_Mode"])["Eval_Accuracy"]
+                      .agg(["mean", "std", "count"]).reset_index())
+            n_seeds_seen = int(stats["count"].max())
+            pivot_mean = stats.pivot(index="Encoding", columns=["K_shift", "Reward_Mode"], values="mean")
+            print(f"\n--- {dname}: mean Eval_Accuracy by Encoding x (K_shift, Reward_Mode) "
+                  f"(n<={n_seeds_seen} seed{'s' if n_seeds_seen != 1 else ''}) ---")
+            with pd.option_context("display.width", 180, "display.precision", 4):
+                print(pivot_mean)
+            if n_seeds_seen > 1:
+                pivot_std = stats.pivot(index="Encoding", columns=["K_shift", "Reward_Mode"], values="std")
+                print(f"--- {dname}: std dev across seeds ---")
+                with pd.option_context("display.width", 180, "display.precision", 4):
+                    print(pivot_std)
+            else:
+                print("(single seed - std dev not meaningful; pass --seeds with "
+                      ">=3 values for a real comparison)")
+
+
+if __name__ == "__main__":
+    main()
