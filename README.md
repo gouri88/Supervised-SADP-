@@ -6,4 +6,4 @@ In the primary analysis, we present the main benchmark datasets used to conduct 
 
 Additionally, we extend our study to medical imaging datasets. For colored images, we use the lung and colon histopathology dataset, where lung and colon samples are evaluated separately. Instead of using the multiple cancer sub-categories provided in the dataset, all cancer-related classes are merged into a single “cancerous” class, resulting in a binary classification task (cancerous vs. non-cancerous) (https://www.kaggle.com/datasets/andrewmvd/lung-and-colon-cancer-histopathological-images).
 
-We also evaluate our approach on a grayscale MRI brain tumor dataset, which is used for binary classification of tumor vs. non-tumor images (https://www.kaggle.com/datasets/mohammadhossein77/brain-tumors-dataset). We also conducted an Optuna-based hyperparameter optimization analysis.
+We also evaluate our approach on a grayscale MRI brain tumor dataset, which is used for binary classification of tumor vs. non-tumor images (https://www.kaggle.com/datasets/mohammadhossein77/brain-tumors-dataset). 
